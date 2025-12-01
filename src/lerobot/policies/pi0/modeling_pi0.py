@@ -64,10 +64,32 @@ def get_safe_dtype(target_dtype, device_type):
     return target_dtype
 
 
-def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
-    time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+def create_sinusoidal_pos_embedding(
+    time: torch.Tensor,
+    dimension: int,
+    min_period: float,
+    max_period: float,
+    device: torch.device,
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """
+    Computes sine-cosine positional embedding vectors for scalar positions.
+
+    Args:
+        time (torch.Tensor):
+            Tensor of shape (batch_size,) containing scalar time positions.
+        dimension (int):
+            Dimension of the positional embedding (must be divisible by 2).
+        min_period (float):
+            Minimum period for the sine-cosine functions.
+        max_period (float):
+            Maximum period for the sine-cosine functions.
+        device (torch.device):
+            Device to perform the computation on.
+
+    Returns:
+        Tensor:
+            Positional embeddings of shape (batch_size, dimension).
+    """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
@@ -84,7 +106,29 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
 
-def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
+def sample_beta(
+    alpha: float,
+    beta: float,
+    bsize: int,
+    device: torch.device,
+) -> Tensor:
+    """
+    Sample from a Beta distribution using PyTorch.
+
+    Args:
+        alpha (float):
+            Alpha parameter of the Beta distribution.
+        beta (float):
+            Beta parameter of the Beta distribution.
+        bsize (int):
+            Number of samples to draw.
+        device (torch.device):
+            Device to perform the sampling on.
+
+    Returns:
+        Tensor:
+            Samples drawn from the Beta distribution of shape (batch_size,).
+    """
     alpha_t = torch.as_tensor(alpha, dtype=torch.float32, device=device)
     beta_t = torch.as_tensor(beta, dtype=torch.float32, device=device)
     dist = torch.distributions.Beta(alpha_t, beta_t)
@@ -573,7 +617,16 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
-    def sample_noise(self, shape, device):
+    def sample_noise(self, shape: torch.Size, device: torch.device) -> Tensor:
+        """
+        Sample standard normal noise.
+
+        Args:
+            shape (torch.Size):
+                Shape of the noise to sample (batch_size, chunk_size, action_dim)
+            device (torch.device):
+                Device to sample the noise on (e.g., 'cpu', 'cuda:0')
+        """
         return torch.normal(
             mean=0.0,
             std=1.0,
@@ -582,7 +635,20 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             device=device,
         )
 
-    def sample_time(self, bsize, device):
+    def sample_time(self, bsize: int, device: torch.device) -> Tensor:
+        """
+        Sample time steps from a Beta distribution.
+
+        Args:
+            bsize (int):
+                Batch size (actions (batch_size, chunk_size, action_dim) -> actions.shape[0] (batch_size))
+            device (torch.device):
+                Device to sample the time steps on (e.g., 'cpu', 'cuda:0')
+
+        Returns:
+            Tensor:
+                Sampled time steps of shape (batch_size,)
+        """
         time_beta = sample_beta(
             self.config.time_sampling_beta_alpha, self.config.time_sampling_beta_beta, bsize, device
         )
@@ -590,50 +656,126 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self,
+        images: torch.Tensor,
+        img_masks: torch.Tensor,
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer."""
-        embs = []
+        """
+        Embed images with SigLIP and language tokens with embedding layer.
+
+        Args:
+            images (torch.Tensor):
+                (batch_size, num_images, channels, height, width)
+            img_masks (torch.Tensor):
+                (batch_size, num_images) boolean mask for valid images
+            lang_tokens (torch.Tensor):
+                (batch_size, seq_length) language token ids
+            lang_masks (torch.Tensor):
+                (batch_size, seq_length) boolean mask for valid language tokens
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                embeddings (torch.Tensor):
+                    (batch_size, total_seq_length, emb_dim) concatenated image and language embeddings
+                pad_masks (torch.Tensor):
+                    (batch_size, total_seq_length) boolean mask for valid embeddings
+                att_masks (torch.Tensor):
+                    (batch_size, total_seq_length) attention mask indicating which tokens can attend to which
+        """
+        embeddings = []
         pad_masks = []
         att_masks = []
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
 
-            def image_embed_func(img):
+            def image_embed_func(img: torch.Tensor) -> torch.Tensor:
+                """
+                convert image to image embeddings
+
+                Args:
+                    img (torch.Tensor):
+                        (batch_size, channels, height, width)
+
+                Returns:
+                    torch.Tensor:
+                        (batch_size, num_img_embeddings, img_embeddings_dim)
+                """
                 return self.paligemma_with_expert.embed_image(img)
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+            img_emb = self._apply_checkpoint(image_embed_func, img)  # type: torch.Tensor
             bsize, num_img_embs = img_emb.shape[:2]
 
-            embs.append(img_emb)
+            """
+            img_mask: (batch_size, num_images) -> (batch_size, num_img_embeddings)
+            """
+            embeddings.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
 
         # Process language tokens
-        def lang_embed_func(lang_tokens):
+        def lang_embed_func(lang_tokens: torch.Tensor) -> torch.Tensor:
+            """
+            Embed language tokens using the PaliGemma language embedding layer.
+            scale embeddings by sqrt of embedding dimension.
+
+            Args:
+                lang_tokens (torch.Tensor):
+                    (batch_size, seq_length) language token ids
+
+            Returns:
+                torch.Tensor:
+                    (batch_size, seq_length, lang_emb_dim) language embeddings
+            """
             lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
+        embeddings.append(lang_emb)  # embeddings: [img_emb0, img_emb1, ..., lang_emb]
+        pad_masks.append(lang_masks)  # pad_masks: [img_mask0, img_mask1, ..., lang_mask]
 
-        num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
+        num_lang_embs = lang_emb.shape[1]  # seq_length
+        att_masks += [0] * num_lang_embs  # att_masks: (img_emb0_len + img_emb1_len + ... + lang_emb_len)
 
-        embs = torch.cat(embs, dim=1)
+        """
+        Concatenate all embeddings, pad_masks, and convert att_masks to tensor.
+        embeddings: (batch_size, total_seq_length, emb_dim)
+            total_seq_length = sum of all image embedding's lengths + language embedding seq_length
+        pad_masks: (batch_size, total_seq_length)
+        att_masks: (total_seq_length,)
+        """
+        embeddings = torch.cat(embeddings, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks
+        return embeddings, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(
+        self,
+        state: torch.Tensor,
+        noisy_actions: torch.Tensor,
+        timestep: torch.Tensor,
+    ):
+        """
+        Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
+
+        Args:
+            state (torch.Tensor):
+                (batch_size, state_dim) current state
+            noisy_actions (torch.Tensor):
+                (batch_size, chunk_size, action_dim) noisy actions
+            timestep (torch.Tensor):
+                (batch_size,) time steps
+
+        Returns:
+
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -641,9 +783,25 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if self.state_proj.weight.dtype == torch.float32:
             state = state.to(torch.float32)
 
-        def state_proj_func(state):
+        def state_proj_func(state: torch.Tensor) -> torch.Tensor:
+            """
+            Project state to action expert embedding dimension.
+
+            Args:
+                state (torch.Tensor):
+                    (batch_size, state_dim) current state
+
+            Returns:
+                torch.Tensor:
+                    (batch_size, action_dim) projected state embedding
+            """
             return self.state_proj(state)
 
+        """
+        sate_emb: (batch_size, action_dim)
+        state_emb[:, None, :]: (batch_size, 1, action_dim)
+        state_mask: (batch_size, 1)
+        """
         state_emb = self._apply_checkpoint(state_proj_func, state)
         embs.append(state_emb[:, None, :])
         bsize = state_emb.shape[0]
@@ -654,6 +812,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks += [1]
 
         # Embed timestep using sine-cosine positional encoding
+        # time_emb: (batch_size, action_in_proj.out_features)
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
             self.action_in_proj.out_features,
@@ -664,19 +823,48 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time_emb = time_emb.type(dtype=timestep.dtype)
 
         # Fuse timestep + action information using an MLP
-        def action_proj_func(noisy_actions):
+        def action_proj_func(noisy_actions: torch.Tensor) -> torch.Tensor:
+            """
+            Project noisy actions to action expert embedding dimension.
+
+            Args:
+                noisy_actions (torch.Tensor):
+                    (batch_size, chunk_size, action_dim) noisy actions
+
+            Returns:
+                torch.Tensor:
+                    (batch_size, chunk_size, action_expert_emb_dim) projected noisy actions
+            """
             return self.action_in_proj(noisy_actions)
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
+        """
+        time_emb: (batch_size, action_expert_emb_dim) -> (batch_size, 1, action_expert_emb_dim)
+        action_time_emb: (batch_size, chunk_size, 2 * action_expert_emb_dim)
+        """
         time_emb = time_emb[:, None, :].expand_as(action_emb)
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
-        def mlp_func(action_time_emb):
+        def mlp_func(action_time_emb: torch.Tensor) -> torch.Tensor:
+            """
+            MLP to fuse action and time embeddings.
+
+            Args:
+                action_time_emb (torch.Tensor):
+                    (batch_size, chunk_size, 2 * action_expert_emb_dim) concatenated action and time embeddings
+
+            Returns:
+                torch.Tensor:
+                    (batch_size, chunk_size, action_expert_emb_dim) fused action-time embeddings
+            """
             x = self.action_time_mlp_in(action_time_emb)
             x = F.silu(x)
             return self.action_time_mlp_out(x)
 
+        """
+        action_time_emb: (batch_size, chunk_size, action_expert_emb_dim)
+        """
         action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
         adarms_cond = None
 
@@ -696,15 +884,51 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self,
+        images: torch.Tensor,
+        img_masks: torch.Tensor,
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+        state: torch.Tensor,
+        actions: torch.Tensor,
+        noise: torch.Tensor | None = None,
+        time: torch.Tensor | None = None,
     ) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
+        """
+        Do a full training forward pass and compute the loss.
+
+        Args:
+            images (torch.Tensor):
+                (batch_size, num_images, channels, height, width)
+            img_masks (torch.Tensor):
+                (batch_size, num_images) boolean mask for valid images
+            lang_tokens (torch.Tensor):
+                (batch_size, seq_length) language token ids
+            lang_masks (torch.Tensor):
+                (batch_size, seq_length) boolean mask for valid language tokens
+            state (torch.Tensor):
+                (batch_size, state_dim) current state
+            actions (torch.Tensor):
+                (batch_size, chunk_size, action_dim) ground truth actions
+            noise (torch.Tensor):
+                (batch_size, chunk_size, action_dim) optional noise to use
+            time (torch.Tensor):
+                (batch_size,) optional time steps to use
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
+        """
+        Expand time to match action dimensions
+        time: (batch_size,) -> (batch_size, 1, 1)
+
+        x_t = \tau * noise + (1 - \tau) * actions
+        u_t = noise - actions
+        reference: https://arxiv.org/abs/2410.24164v1 (section 4)
+        """
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
